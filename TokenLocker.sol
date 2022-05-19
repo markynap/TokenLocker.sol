@@ -161,4 +161,18 @@ contract TokenLocker {
         return userInfo[user];
     }
 
+    function listLockDataForUser(address user) external view returns (address[] memory tokens, uint256[] memory amounts, uint256[] memory expirationDates) {
+        for (uint i = 0; i < userInfo[user].length; i++) {
+            tokens.push(
+                lockInfo[userInfo[user][i]].token
+            );
+            amounts.push(
+                lockInfo[userInfo[user][i]].lockAmount
+            );
+            expirationDates.push(
+                lockInfo[userInfo[user][i]].lockExpiration
+            );
+        }
+    }
+
 }
