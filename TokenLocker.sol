@@ -3,96 +3,162 @@ pragma solidity 0.8.4;
 
 import "./IERC20.sol";
 
-/**
-    Locks ERC20 Tokens In Contract And Tracks All Lock Data
- */
 contract TokenLocker {
 
-    // Locker Structure
-    struct Lock {
-        uint amountLocked;
-        uint blockLocked;
-        uint lockDuration;
+    // List Of Token Lock Information
+    struct TokenLockInfo {
+        address token;
+        address lockAddress;
+        uint256 lockAmount;
+        uint256 lockExpiration;
     }
 
-    // User -> Token -> ID -> Lock Data
-    mapping ( address => mapping ( address => mapping ( uint256 => Lock ))) public userLocks;
+    // ID -> Token Lock Info
+    mapping ( uint256 => TokenLockInfo ) public lockInfo;
 
-    // User -> Token -> CurrentID
-    mapping ( address => mapping ( address => uint256 )) public nonces;
+    // User -> ID[]
+    mapping ( address => uint256[] ) public userInfo;
+
+    // Global Nonce
+    uint256 public nonce;
 
     // Events
-    event Lock(address indexed userLockingTokens, address token, uint256 ID, uint256 amount, uint256 durationInBlocks);
-    event Unlock(address indexed recipientOfLockedTokens, address token, uint256 ID, uint256 amount);
+    event Locked(address token, uint256 amount, uint256 ID, uint256 duration);
+    event Unlocked(address token, uint256 amount, uint256 ID);
+    event Relocked(address token, uint256 amount, uint256 ID, uint256 newDuration);
 
-    function timeUntilUnlock(address user, address token, uint256 ID) external view returns (uint256) {
-        uint bLocked = userLocks[user][token][ID].blockLocked;
-        uint duration = userLocks[user][token][ID].lockDuration;
-        return bLocked + duration > block.number ? (bLocked + duration - block.number) : 0;
+    function lock(address token, uint256 amount, uint256 duration) external returns (uint256 ID) {
+        
+        // transfer in locked token
+        uint received = _transferIn(token, amount);
+
+        // Set Lock Info For ID
+        lockInfo[nonce].token = token;
+        lockInfo[nonce].lockAddress = msg.sender;
+        lockInfo[nonce].lockAmount = received;
+        lockInfo[nonce].lockExpiration = block.number + duration;
+
+        // Add To User's List Of Lock IDs
+        userInfo[msg.sender].push(nonce);
+        
+        // emit Lock Event
+        emit Locked(token, received, nonce, duration);
+
+        // Increment Nonce
+        nonce++;
+
+        // return ID Used
+        return nonce - 1;
     }
 
-    function getAmountLocked(address user, address token, uint256 ID) external view returns (uint256) {
-        return userLocks[user][token][ID].amountLocked;
-    }
+    function unlock(uint256 ID) external {
+        
+        // Fetch Data From ID
+        address unlocker   = lockInfo[ID].lockAddress;
+        uint256 lockAmount = lockInfo[ID].lockAmount;
+        uint256 lockExpiry = lockInfo[ID].lockExpiration;
 
-    function _unlock(address token, uint256 ID, uint256 amount) internal {
+        // Require Conditions Are Met
         require(
-            nonces[msg.sender][token] > ID,
-            'Nonce Does not Match'
+            msg.sender == unlocker,
+            'Only Unlocker Can Unlock'
         );
         require(
-            token != address(0) && amount > 0,
-            'Zero Inputs'
-        );
-        require(
-            userLocks[msg.sender][token][ID].amountLocked >= amount,
-            'Insufficient Lock Amount'
-        );
-        require(
-            userLocks[msg.sender][token][ID].amountLocked > 0 &&
-            userLocks[msg.sender][token][ID].blockLocked > 0 &&
-            userLocks[msg.sender][token][ID].blockDuration > 0,
-            'Zero Values'
-        );
-        require(
-            userLocks[msg.sender][token][ID].blockLocked + userLocks[msg.sender][token][ID].blockDuration <= block.number,
+            lockExpiry <= block.number,
             'Lock Has Not Expired'
         );
-
-        // update amount locked
-        userLocks[msg.sender][token][ID].amountLocked -= amount;
-        
-        // redeem tokens for caller
-        bool s = IERC20(token).transfer(msg.sender, amount);
-        require(s, 'Failure On Token Transfer');
-
-        // emit event
-        emit Unlock(msg.sender, token, ID, amount);
-    }
-
-    function _lock(address token, uint256 amount, uint256 duration) internal {
         require(
-            token != address(0) && amount > 0 && duration > 0,
-            'Zero Inputs'
+            lockAmount > 0,
+            'Nothing To Unlock'
         );
 
-        // transfer in tokens
-        uint before = IERC20(token).balanceOf(address(this));
-        bool s = IERC20(token).transferFrom(msg.sender, address(this), amount);
-        require(s, 'Failure On Transfer From');
-        uint after = IERC20(token).balanceOf(address(this));
-        require(after > before, 'Zero Received');
-        uint received = after - before;
+        // reset lock amount
+        delete lockInfo[ID].lockAmount;
+        
+        // remove ID from user's list of lock IDs
+        _removeID(unlocker, ID);
 
-        // set data
-        userLocks[msg.sender][token][nonces[msg.sender][token]].amountLocked = amount;
-        userLocks[msg.sender][token][nonces[msg.sender][token]].blockLocked = block.number;
-        userLocks[msg.sender][token][nonces[msg.sender][token]].lockDuration = duration;
+        // transfer locked tokens to unlocker address
+        require(
+            IERC20(lockInfo[ID].token).transfer(
+                unlocker,
+                lockAmount
+            ),
+            'Failure On Token Transfer'
+        );
 
-        // emit event
-        emit Lock(msg.sender, token, nonces[msg.sender][token], amount, duration);
-
-        // update nonce
-        nonces[msg.sender][token]++;
+        // emit Unlocked Event
+        emit Unlocked(lockInfo[ID].token, lockAmount, ID);
     }
+
+    function relock(uint256 ID, uint256 newLockDuration) external {
+
+        // Fetch Data From ID
+        address unlocker   = lockInfo[ID].lockAddress;
+        uint256 lockAmount = lockInfo[ID].lockAmount;
+        uint256 lockExpiry = lockInfo[ID].lockExpiration;
+
+        // Require Conditions Are Met
+        require(
+            msg.sender == unlocker,
+            'Only Unlocker Can Unlock'
+        );
+        require(
+            lockExpiry <= block.number,
+            'Lock Has Not Expired'
+        );
+        require(
+            lockAmount > 0,
+            'Nothing To ReLock'
+        );
+
+        // set new expiration date
+        lockInfo[ID].lockExpiration = block.number + newLockDuration;
+
+        // emit Relocked Event
+        emit Relocked(lockInfo[ID].token, lockAmount, ID, newLockDuration);
+    }
+
+    function _transferIn(address token, uint256 amount) internal returns (uint256) {
+        uint before = IERC20(token).balanceOf(address(this));
+        require(
+            IERC20(token).transferFrom(
+                msg.sender,
+                address(this),
+                amount
+            ),
+            'Error On Transfer From'
+        );
+        uint After = IERC20(token).balanceOf(address(this));
+        require(
+            After > before,
+            'Zero Tokens Received'
+        );
+        return After - before;
+    }
+
+    function _removeID(address user, uint256 ID) internal {
+
+        uint index = userInfo[user].length;
+        for (uint i = 0; i < userInfo[user].length; i++) {
+            if (userInfo[user][i] == ID) {
+                index = i;
+                break;
+            }
+        }
+        require(index < userInfo[user].length, 'ID Not Found');
+
+        userInfo[user][index] = userInfo[user][userInfo[user].length - 1];
+        userInfo[user].pop();
+    }
+
+    function timeUntilUnlock(uint256 ID) external view returns (uint256) {
+        uint unlocksAt = lockInfo[ID].lockExpiration;
+        return unlocksAt > block.number ? unlocksAt - block.number : 0;
+    }
+
+    function listLockIDs(address user) external view returns (uint256[] memory) {
+        return userInfo[user];
+    }
+
 }
